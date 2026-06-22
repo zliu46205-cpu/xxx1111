@@ -1,4 +1,4 @@
-﻿import http from "node:http";
+import http from "node:http";
 import crypto from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import path from "node:path";
@@ -15,6 +15,8 @@ const files = {
 };
 const port = Number(process.env.XUANXUE_API_PORT || 8787);
 const sessionSecret = process.env.SESSION_SECRET || "local-dev-session-secret-change-before-deploy";
+
+const API_VERSION = "deepseek-json-v2";
 
 const PLANS = {
   free: { name: "免费试测", amount: 0, credits: 1, type: "free" },
@@ -106,6 +108,7 @@ async function generateAiReport(baseReport, values, method) {
         { role: "user", content: `请基于以下输入生成更具体的商业级中文术数参考报告。只返回 JSON。\n${JSON.stringify(input)}` },
       ],
       temperature: 0.75,
+      response_format: { type: "json_object" },
       max_tokens: 2600,
     }),
   });
@@ -273,7 +276,7 @@ async function createReport(req, res) {
   try {
     report = await generateAiReport(report, values, method);
   } catch (error) {
-    report = { ...report, generatedBy: "rules", aiError: "AI_GENERATION_FALLBACK" };
+    report = { ...report, generatedBy: "rules", aiError: String(error?.message || "AI_GENERATION_FALLBACK").slice(0, 180) };
   }
   const rows = await readList(files.reports);
   rows.unshift({ id: report.id, createdAt: report.createdAt, userId: session?.role === "user" ? session.userId : null, methodId: method.id, methodName: method.name, question: values.question, concernType: values.concernType, report });
@@ -343,7 +346,7 @@ const server = http.createServer(async (req, res) => {
   try {
     const url = new URL(req.url, `http://${req.headers.host}`);
     if (req.method === "OPTIONS") return sendJson(res, 204, {});
-    if (req.method === "GET" && url.pathname === "/api/health") return sendJson(res, 200, { ok: true, service: "xuanxue-api", ai: process.env.DEEPSEEK_API_KEY ? "configured" : "not-configured", model: process.env.DEEPSEEK_MODEL || "deepseek-v4-flash" });
+    if (req.method === "GET" && url.pathname === "/api/health") return sendJson(res, 200, { ok: true, service: "xuanxue-api", version: API_VERSION, ai: process.env.DEEPSEEK_API_KEY ? "configured" : "not-configured", model: process.env.DEEPSEEK_MODEL || "deepseek-v4-flash" });
     if (req.method === "POST" && url.pathname === "/api/auth/register") return register(req, res);
     if (req.method === "POST" && url.pathname === "/api/auth/login") return login(req, res);
     if (req.method === "POST" && url.pathname === "/api/admin/login") return adminLogin(req, res);

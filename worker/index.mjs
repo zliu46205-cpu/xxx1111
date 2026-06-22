@@ -1,4 +1,4 @@
-﻿import { buildReport, validateIntake } from "../src/utils/report.js";
+import { buildReport, validateIntake } from "../src/utils/report.js";
 
 const jsonHeaders = {
   "content-type": "application/json; charset=utf-8",
@@ -6,6 +6,8 @@ const jsonHeaders = {
   "access-control-allow-methods": "GET,POST,OPTIONS",
   "access-control-allow-headers": "content-type, authorization",
 };
+
+const API_VERSION = "deepseek-json-v2";
 
 const PLANS = {
   free: { name: "免费试测", amount: 0, credits: 1, type: "free" },
@@ -106,6 +108,7 @@ async function generateAiReport(baseReport, values, method, env) {
         { role: "user", content: `请基于以下输入生成更具体的商业级中文术数参考报告。只返回 JSON。\n${JSON.stringify(input)}` },
       ],
       temperature: 0.75,
+      response_format: { type: "json_object" },
       max_tokens: 2600,
     }),
   });
@@ -366,7 +369,7 @@ async function createReport(request, env) {
   try {
     report = await generateAiReport(report, values, method, env);
   } catch (error) {
-    report = { ...report, generatedBy: "rules", aiError: "AI_GENERATION_FALLBACK" };
+    report = { ...report, generatedBy: "rules", aiError: String(error?.message || "AI_GENERATION_FALLBACK").slice(0, 180) };
   }
 
   try {
@@ -465,6 +468,7 @@ async function handleApi(request, env) {
     return sendJson({
       ok: true,
       service: "xuanxue-worker-api",
+      version: API_VERSION,
       storage: env.DB ? "d1" : "not-configured",
       ai: env.DEEPSEEK_API_KEY ? "configured" : "not-configured",
       model: env.DEEPSEEK_MODEL || "deepseek-v4-flash",
