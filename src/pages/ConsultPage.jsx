@@ -30,6 +30,12 @@ const readingFocusOptions = [
 const toneOptions = ["温和清楚", "直接一点", "专业一点", "更白话一点"];
 const detailOptions = ["大众易懂", "术语稍多", "行动优先"];
 
+const reportTierOptions = [
+  { id: "free", name: "免费简版", price: "¥0", desc: "一句话总断、核心卡点、3 条行动建议。适合先试用。" },
+  { id: "standard", name: "标准报告", price: "¥19.9", desc: "完整依据、象征推演、白话解释、阶段建议。适合单个明确问题。" },
+  { id: "deep", name: "深度报告", price: "¥69", desc: "更细的术语分析、限制假设、行动清单和复盘问题。适合重要主题。" },
+];
+
 const localFieldLabels = {
   birthDate: "出生日期",
   birthTime: "出生时间",
@@ -46,7 +52,7 @@ const localFieldLabels = {
   background: "补充背景",
 };
 
-export function ConsultPage({ selectedMethod, selectMethod, session }) {
+export function ConsultPage({ selectedMethod, selectMethod, session, setRoute }) {
   const method = useMemo(() => methods.find((item) => item.id === selectedMethod) || methods[0], [selectedMethod]);
   const [values, setValues] = useState({
     question: "",
@@ -70,6 +76,7 @@ export function ConsultPage({ selectedMethod, selectMethod, session }) {
     style: "",
     contact: "",
     privacyAccepted: false,
+    reportTier: "free",
   });
   const [errors, setErrors] = useState({});
   const [status, setStatus] = useState("idle");
@@ -121,6 +128,7 @@ export function ConsultPage({ selectedMethod, selectMethod, session }) {
       nameBase: "观象",
       style: "稳重、清雅、东方文化感",
       privacyAccepted: true,
+      reportTier: "standard",
     }));
     setErrors({});
   }
@@ -161,6 +169,12 @@ export function ConsultPage({ selectedMethod, selectMethod, session }) {
     setReport(null);
     setStatus("loading");
     try {
+      if (values.reportTier !== "free" && !session) {
+        setNotice("标准报告和深度报告需要登录并消耗次数。请先登录，或选择免费简版。");
+        setRoute?.("login");
+        setStatus("idle");
+        return;
+      }
       const payload = await createReport(values, method, session);
       setReport(payload.report);
       setStatus("ready");
@@ -168,7 +182,24 @@ export function ConsultPage({ selectedMethod, selectMethod, session }) {
       setNotice(session ? "报告已生成并保存到你的用户中心。" : "报告已生成。登录后可以保存到用户中心并查看历史。");
       const historyPayload = await listReports(6, session);
       setReportHistory(historyPayload.reports || []);
-    } catch {
+    } catch (error) {
+      if (error?.payload?.code === "INSUFFICIENT_CREDITS") {
+        setNotice(error.message || "剩余次数不足，请先购买套餐或选择免费简版。");
+        setRoute?.("billing");
+        setStatus("idle");
+        return;
+      }
+      if (error?.payload?.code === "LOGIN_REQUIRED") {
+        setNotice(error.message || "请先登录后再生成标准或深度报告。");
+        setRoute?.("login");
+        setStatus("idle");
+        return;
+      }
+      if (error?.payload?.code === "PAID_REPORT_AI_UNAVAILABLE") {
+        setNotice(error.message || "深度生成服务暂时不可用，本次未扣次数。请稍后重试，或先生成免费简版。");
+        setStatus("idle");
+        return;
+      }
       const fallbackReport = buildReport(values, method);
       setReport(fallbackReport);
       setStatus("ready");
@@ -211,6 +242,27 @@ export function ConsultPage({ selectedMethod, selectMethod, session }) {
             <span>三步问诊</span>
             <strong>选方法 → 说问题 → 定重点</strong>
             <p>信息越具体，报告越少套话；不愿提供出生信息也可以走简化路径。</p>
+          </div>
+
+          <div className="tier-selector">
+            <div className="tier-title">
+              <span>报告档位</span>
+              <strong>先免费体验，再按需要解锁深度</strong>
+            </div>
+            <div className="tier-grid">
+              {reportTierOptions.map((tier) => (
+                <button
+                  type="button"
+                  key={tier.id}
+                  className={values.reportTier === tier.id ? "tier-card selected" : "tier-card"}
+                  onClick={() => update("reportTier", tier.id)}
+                >
+                  <span>{tier.price}</span>
+                  <strong>{tier.name}</strong>
+                  <small>{tier.desc}</small>
+                </button>
+              ))}
+            </div>
           </div>
 
           <label>
@@ -393,6 +445,7 @@ function ReportPanel({ report, copySummary, exportText, regenerate }) {
       <div className="report-main">
         <header>
           <span>{report.id}</span>
+          <small className="report-tier-badge">{report.reportTierName || "免费简版"}</small>
           <h2>{report.title}</h2>
           <p>{report.createdAt}</p>
         </header>
@@ -490,5 +543,4 @@ function ReportPanel({ report, copySummary, exportText, regenerate }) {
     </article>
   );
 }
-
 

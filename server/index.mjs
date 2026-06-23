@@ -20,11 +20,21 @@ const API_VERSION = "deepseek-json-v2";
 
 const PLANS = {
   free: { name: "免费试测", amount: 0, credits: 1, type: "free" },
-  single: { name: "单项精批", amount: 1990, credits: 3, type: "credits" },
+  single: { name: "标准/深度体验包", amount: 1990, credits: 3, type: "credits" },
   monthly: { name: "月卡会员", amount: 9900, credits: 30, type: "membership", days: 30 },
   yearly: { name: "年卡会员", amount: 39900, credits: 420, type: "membership", days: 365 },
   review: { name: "人工复核", amount: 29900, credits: 1, type: "service" },
 };
+
+const REPORT_TIERS = {
+  free: { name: "免费简版", maxTokens: 1400, creditCost: 0, guidance: "免费简版只输出关键结论、核心依据、3-4条建议；保留悬念但不制造焦虑；不要暗示付费才能避灾。" },
+  standard: { name: "标准报告", maxTokens: 2600, creditCost: 1, guidance: "标准报告输出完整结构：依据、推演、倾向、建议、边界；术语和白话都要兼顾。" },
+  deep: { name: "深度报告", maxTokens: 3600, creditCost: 3, guidance: "深度报告增加假设限制、阶段拆解、术语解释、行动清单和复盘问题；仍不得恐吓或保证结果。" },
+};
+
+function normalizeReportTier(value) {
+  return REPORT_TIERS[value] ? value : "free";
+}
 
 const AI_REPORT_INSTRUCTIONS = `
 你是“天机观象”的中国传统术数报告生成器。你要按 chinese-metaphysics-advisor 的原则输出：中文优先、术语准确、白话能懂、结论审慎、现实可执行。
@@ -59,6 +69,8 @@ function mergeAiReport(baseReport, aiReport) {
     suggestions: safeArray(aiReport.suggestions, baseReport.suggestions),
     stageAdvice: safeArray(aiReport.stageAdvice, baseReport.stageAdvice),
     termGlossary: safeArray(aiReport.termGlossary, baseReport.termGlossary),
+    reportTier: baseReport.reportTier,
+    reportTierName: baseReport.reportTierName,
     generatedBy: "deepseek",
   };
   if (aiReport.oracle && typeof aiReport.oracle === "object") {
@@ -70,8 +82,12 @@ function mergeAiReport(baseReport, aiReport) {
 async function generateAiReport(baseReport, values, method) {
   if (!process.env.DEEPSEEK_API_KEY) return baseReport;
   const model = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
+  const reportTier = normalizeReportTier(values.reportTier);
+  const tier = REPORT_TIERS[reportTier];
   const input = {
     method,
+    reportTier,
+    tierGuidance: tier.guidance,
     values: {
       question: values.question,
       concernType: values.concernType,
@@ -92,6 +108,7 @@ async function generateAiReport(baseReport, values, method) {
       options: values.options,
       nameBase: values.nameBase,
       style: values.style,
+      reportTier: values.reportTier,
     },
     baseReport,
   };
@@ -105,11 +122,11 @@ async function generateAiReport(baseReport, values, method) {
       model,
       messages: [
         { role: "system", content: AI_REPORT_INSTRUCTIONS },
-        { role: "user", content: `请基于以下输入生成更具体的商业级中文术数参考报告。只返回 JSON。\n${JSON.stringify(input)}` },
+        { role: "user", content: `请基于以下输入生成${tier.name}。档位要求：${tier.guidance}。只返回 JSON，不要 Markdown。\n${JSON.stringify(input)}` },
       ],
       temperature: 0.75,
       response_format: { type: "json_object" },
-      max_tokens: 2600,
+      max_tokens: tier.maxTokens,
     }),
   });
   if (!response.ok) throw new Error(`DeepSeek request failed: ${response.status}`);
@@ -212,6 +229,7 @@ function sanitizeValues(values = {}) {
     nameBase: String(values.nameBase || "").slice(0, 120),
     style: String(values.style || "").slice(0, 200),
     contact: String(values.contact || "").slice(0, 120),
+    reportTier: normalizeReportTier(values.reportTier),
     privacyAccepted: Boolean(values.privacyAccepted),
   };
 }
@@ -272,16 +290,39 @@ async function createReport(req, res) {
   const method = sanitizeMethod(body.method);
   const errors = validateIntake(values);
   if (Object.keys(errors).length) return sendJson(res, 422, { ok: false, errors });
+  const tierInfo = REPORT_TIERS[values.reportTier];
+  const creditCost = tierInfo.creditCost || 0;
+  let users = null;
+  let user = null;
+  if (creditCost > 0) {
+    if (!session?.userId || session.role !== "user") {
+      return sendJson(res, 401, { ok: false, code: "LOGIN_REQUIRED", message: "标准报告和深度报告需要先登录，并消耗账户次数。" });
+    }
+    users = await readList(files.users);
+    user = users.find((item) => item.id === session.userId && item.status === "active");
+    if (!user || Number(user.credits || 0) < creditCost) {
+      return sendJson(res, 402, { ok: false, code: "INSUFFICIENT_CREDITS", message: `当前剩余次数不足。${tierInfo.name}需要 ${creditCost} 次，请先购买套餐或选择免费简版。`, requiredCredits: creditCost, currentCredits: Number(user?.credits || 0) });
+    }
+  }
   let report = buildReport(values, method);
+  report = { ...report, reportTier: values.reportTier, reportTierName: REPORT_TIERS[values.reportTier].name };
   try {
     report = await generateAiReport(report, values, method);
   } catch (error) {
     report = { ...report, generatedBy: "rules", aiError: String(error?.message || "AI_GENERATION_FALLBACK").slice(0, 180) };
   }
+  if (creditCost > 0 && report.generatedBy !== "deepseek") {
+    return sendJson(res, 503, { ok: false, code: "PAID_REPORT_AI_UNAVAILABLE", message: "深度生成服务暂时不可用，本次未扣次数。请稍后重试，或先生成免费简版。", aiError: report.aiError || "AI_GENERATION_FALLBACK" });
+  }
   const rows = await readList(files.reports);
   rows.unshift({ id: report.id, createdAt: report.createdAt, userId: session?.role === "user" ? session.userId : null, methodId: method.id, methodName: method.name, question: values.question, concernType: values.concernType, report });
   await saveList(files.reports, rows.slice(0, 500));
-  sendJson(res, 201, { ok: true, report, saved: true });
+  if (creditCost > 0 && user && users) {
+    user.credits = Math.max(Number(user.credits || 0) - creditCost, 0);
+    await saveList(files.users, users);
+    report = { ...report, creditCost };
+  }
+  sendJson(res, 201, { ok: true, report, saved: true, creditCost });
 }
 
 async function listReports(req, res) {
@@ -324,10 +365,20 @@ async function mockPay(req, res, orderId) {
   const orders = await readList(files.orders);
   const order = orders.find((item) => item.id === orderId && item.userId === session.userId);
   if (!order) return sendJson(res, 404, { ok: false, message: "订单不存在。" });
+  if (order.status === "paid") return sendJson(res, 200, { ok: true, order: orderRow(order) });
   order.status = "paid";
   order.updatedAt = new Date().toISOString();
   order.paidAt = order.updatedAt;
   await saveList(files.orders, orders);
+  const plan = PLANS[order.planId];
+  if (plan?.credits) {
+    const users = await readList(files.users);
+    const user = users.find((item) => item.id === session.userId);
+    if (user) {
+      user.credits = Number(user.credits || 0) + plan.credits;
+      await saveList(files.users, users);
+    }
+  }
   sendJson(res, 200, { ok: true, order: orderRow(order) });
 }
 

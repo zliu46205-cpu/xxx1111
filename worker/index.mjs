@@ -11,11 +11,21 @@ const API_VERSION = "deepseek-json-v2";
 
 const PLANS = {
   free: { name: "免费试测", amount: 0, credits: 1, type: "free" },
-  single: { name: "单项精批", amount: 1990, credits: 3, type: "credits" },
+  single: { name: "标准/深度体验包", amount: 1990, credits: 3, type: "credits" },
   monthly: { name: "月卡会员", amount: 9900, credits: 30, type: "membership", days: 30 },
   yearly: { name: "年卡会员", amount: 39900, credits: 420, type: "membership", days: 365 },
   review: { name: "人工复核", amount: 29900, credits: 1, type: "service" },
 };
+
+const REPORT_TIERS = {
+  free: { name: "免费简版", maxTokens: 1400, creditCost: 0, guidance: "免费简版只输出关键结论、核心依据、3-4条建议；保留悬念但不制造焦虑；不要暗示付费才能避灾。" },
+  standard: { name: "标准报告", maxTokens: 2600, creditCost: 1, guidance: "标准报告输出完整结构：依据、推演、倾向、建议、边界；术语和白话都要兼顾。" },
+  deep: { name: "深度报告", maxTokens: 3600, creditCost: 3, guidance: "深度报告增加假设限制、阶段拆解、术语解释、行动清单和复盘问题；仍不得恐吓或保证结果。" },
+};
+
+function normalizeReportTier(value) {
+  return REPORT_TIERS[value] ? value : "free";
+}
 
 const AI_REPORT_INSTRUCTIONS = `
 你是“天机观象”的中国传统术数报告生成器。你要按 chinese-metaphysics-advisor 的原则输出：中文优先、术语准确、白话能懂、结论审慎、现实可执行。
@@ -58,6 +68,8 @@ function mergeAiReport(baseReport, aiReport) {
     suggestions: safeArray(aiReport.suggestions, baseReport.suggestions),
     stageAdvice: safeArray(aiReport.stageAdvice, baseReport.stageAdvice),
     termGlossary: safeArray(aiReport.termGlossary, baseReport.termGlossary),
+    reportTier: baseReport.reportTier,
+    reportTierName: baseReport.reportTierName,
     generatedBy: "deepseek",
   };
   if (aiReport.oracle && typeof aiReport.oracle === "object") {
@@ -69,8 +81,12 @@ function mergeAiReport(baseReport, aiReport) {
 async function generateAiReport(baseReport, values, method, env) {
   if (!env.DEEPSEEK_API_KEY) return baseReport;
   const model = env.DEEPSEEK_MODEL || "deepseek-v4-flash";
+  const reportTier = normalizeReportTier(values.reportTier);
+  const tier = REPORT_TIERS[reportTier];
   const input = {
     method,
+    reportTier,
+    tierGuidance: tier.guidance,
     values: {
       question: values.question,
       concernType: values.concernType,
@@ -91,6 +107,7 @@ async function generateAiReport(baseReport, values, method, env) {
       options: values.options,
       nameBase: values.nameBase,
       style: values.style,
+      reportTier: values.reportTier,
     },
     baseReport,
   };
@@ -105,11 +122,11 @@ async function generateAiReport(baseReport, values, method, env) {
       model,
       messages: [
         { role: "system", content: AI_REPORT_INSTRUCTIONS },
-        { role: "user", content: `请基于以下输入生成更具体的商业级中文术数参考报告。只返回 JSON。\n${JSON.stringify(input)}` },
+        { role: "user", content: `请基于以下输入生成${tier.name}。档位要求：${tier.guidance}。只返回 JSON，不要 Markdown。\n${JSON.stringify(input)}` },
       ],
       temperature: 0.75,
       response_format: { type: "json_object" },
-      max_tokens: 2600,
+      max_tokens: tier.maxTokens,
     }),
   });
 
@@ -244,6 +261,7 @@ function sanitizeValues(values = {}) {
     nameBase: String(values.nameBase || "").slice(0, 120),
     style: String(values.style || "").slice(0, 200),
     contact: String(values.contact || "").slice(0, 120),
+    reportTier: normalizeReportTier(values.reportTier),
     privacyAccepted: Boolean(values.privacyAccepted),
   };
 }
@@ -364,12 +382,28 @@ async function createReport(request, env) {
   const method = sanitizeMethod(body.method);
   const errors = validateIntake(values);
   if (Object.keys(errors).length) return sendJson({ ok: false, errors }, 422);
+  const tierInfo = REPORT_TIERS[values.reportTier];
+  const creditCost = tierInfo.creditCost || 0;
+  let user = null;
+  if (creditCost > 0) {
+    if (!session?.userId || session.role !== "user") {
+      return sendJson({ ok: false, code: "LOGIN_REQUIRED", message: "标准报告和深度报告需要先登录，并消耗账户次数。" }, 401);
+    }
+    user = await env.DB.prepare(`SELECT id, credits FROM users WHERE id = ? AND status = 'active'`).bind(session.userId).first();
+    if (!user || Number(user.credits || 0) < creditCost) {
+      return sendJson({ ok: false, code: "INSUFFICIENT_CREDITS", message: `当前剩余次数不足。${tierInfo.name}需要 ${creditCost} 次，请先购买套餐或选择免费简版。`, requiredCredits: creditCost, currentCredits: Number(user?.credits || 0) }, 402);
+    }
+  }
 
   let report = buildReport(values, method);
+  report = { ...report, reportTier: values.reportTier, reportTierName: REPORT_TIERS[values.reportTier].name };
   try {
     report = await generateAiReport(report, values, method, env);
   } catch (error) {
     report = { ...report, generatedBy: "rules", aiError: String(error?.message || "AI_GENERATION_FALLBACK").slice(0, 180) };
+  }
+  if (creditCost > 0 && report.generatedBy !== "deepseek") {
+    return sendJson({ ok: false, code: "PAID_REPORT_AI_UNAVAILABLE", message: "深度生成服务暂时不可用，本次未扣次数。请稍后重试，或先生成免费简版。", aiError: report.aiError || "AI_GENERATION_FALLBACK" }, 503);
   }
 
   try {
@@ -381,7 +415,11 @@ async function createReport(request, env) {
       `INSERT INTO reports (id, created_at, method_id, method_name, question, concern_type, report_json) VALUES (?, ?, ?, ?, ?, ?, ?)`,
     ).bind(report.id, report.createdAt, method.id, method.name, values.question, values.concernType, JSON.stringify(report)).run();
   }
-  return sendJson({ ok: true, report, saved: true }, 201);
+  if (creditCost > 0) {
+    await env.DB.prepare(`UPDATE users SET credits = MAX(COALESCE(credits, 0) - ?, 0) WHERE id = ?`).bind(creditCost, session.userId).run().catch(() => null);
+    report = { ...report, creditCost };
+  }
+  return sendJson({ ok: true, report, saved: true, creditCost }, 201);
 }
 
 async function listReports(request, env) {
@@ -431,6 +469,9 @@ async function markMockPaid(request, env, orderId) {
   if (auth.response) return auth.response;
   const order = await env.DB.prepare(`SELECT * FROM orders WHERE id = ? AND user_id = ?`).bind(orderId, auth.session.userId).first();
   if (!order) return sendJson({ ok: false, message: "订单不存在。" }, 404);
+  if (order.status === "paid") {
+    return sendJson({ ok: true, order: { ...formatOrderRecord(order), status: "paid" } });
+  }
   const plan = PLANS[order.plan_id];
   const now = new Date().toISOString();
   await env.DB.prepare(`UPDATE orders SET status = 'paid', updated_at = ?, paid_at = ? WHERE id = ?`).bind(now, now, orderId).run();
